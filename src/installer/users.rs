@@ -442,8 +442,22 @@ impl AddUser {
   pub fn cycle_forward(&mut self) {
     // Tab was pressed
     if self.name_input.is_focused() {
-      self.name_input.unfocus();
-      self.pass_input.focus();
+      // Validate username before allowing focus change
+      if let Some(name) = self.name_input.get_value() {
+        if let Some(name) = name.as_str() {
+          if !name.is_empty() {
+            self.username = Some(name.to_string());
+            self.name_input.unfocus();
+            self.pass_input.focus();
+          } else {
+            self.name_input.error("Username cannot be empty");
+          }
+        } else {
+          self.name_input.error("Username cannot be empty");
+        }
+      } else {
+        self.name_input.error("Username cannot be empty");
+      }
     } else if self.pass_input.is_focused() {
       self.pass_input.unfocus();
       self.pass_confirm.focus();
@@ -615,8 +629,9 @@ impl Page for AddUser {
                 }
               };
 
+              let username = self.username.clone().unwrap_or_default();
               installer.users.push(User {
-                username: self.username.clone().unwrap_or_default(),
+                username,
                 password_hash: hashed,
                 groups: vec![],
                 home_manager_cfg: None,

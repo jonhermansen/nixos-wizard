@@ -15,7 +15,7 @@
     diskoPkg = disko.packages.${system}.disko;
     nixosWizard = pkgs.rustPlatform.buildRustPackage {
       pname = "nixos-wizard";
-      version = "0.2.3";
+      version = "0.3.2";
 
       src = self;
 
@@ -28,6 +28,8 @@
         --prefix PATH : ${pkgs.lib.makeBinPath [
           diskoPkg
           pkgs.bat
+          pkgs.nixfmt-rfc-style
+          pkgs.nixfmt-classic
           pkgs.util-linux
           pkgs.gawk
           pkgs.gnugrep

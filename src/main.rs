@@ -288,22 +288,21 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> an
       .unwrap_or_else(|| Duration::from_secs(0));
 
     // Wait for user input or timeout
-    if event::poll(timeout)? {
-      if let Event::Key(key) = event::read()? {
-        if let Some(page) = page_stack.last_mut() {
-          // Forward keyboard input to the current page
-          let signal = page.handle_input(&mut installer, key);
+    if event::poll(timeout)?
+		&& let Event::Key(key) = event::read()? {
+			if let Some(page) = page_stack.last_mut() {
+				// Forward keyboard input to the current page
+				let signal = page.handle_input(&mut installer, key);
 
-          if handle_signal(signal, &mut page_stack, &mut installer)? {
-            // Page requested application quit
-            break;
-          }
-        } else {
-          // Safety fallback: if no pages exist, return to main menu
-          page_stack.push(Box::new(Menu::new()));
-        }
-      }
-    }
+				if handle_signal(signal, &mut page_stack, &mut installer)? {
+					// Page requested application quit
+					break;
+				}
+			} else {
+				// Safety fallback: if no pages exist, return to main menu
+				page_stack.push(Box::new(Menu::new()));
+			}
+		}
 
     if last_tick.elapsed() >= tick_rate {
       last_tick = Instant::now();
