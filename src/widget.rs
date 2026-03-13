@@ -1491,6 +1491,9 @@ impl TableRow {
 #[derive(Clone, Debug)]
 pub struct TableWidget {
   pub focused: bool,
+  pub scroll_only: bool,
+  pub scroll_offset: usize,
+  pub visible_rows: std::cell::Cell<usize>,
   pub selected_row: Option<usize>,
   pub title: String,
   pub num_fields: usize,
@@ -1509,6 +1512,9 @@ impl TableWidget {
     let num_fields = headers.len();
     Self {
       focused: false,
+      scroll_only: false,
+      scroll_offset: 0,
+      visible_rows: std::cell::Cell::new(0),
       selected_row: None,
       title: title.into(),
       num_fields,
@@ -1519,11 +1525,29 @@ impl TableWidget {
   }
   pub fn set_rows(&mut self, rows: Vec<Vec<String>>) {
     self.rows = rows;
-    if let Some(idx) = self.selected_row {
-      if idx >= self.rows.len() {
-        self.selected_row = None;
-      }
+    if let Some(idx) = self.selected_row
+      && idx >= self.rows.len()
+    {
+      self.selected_row = None;
     }
+  }
+  pub fn sort_rows_by_header(&mut self, header: &str) -> Result<(), String> {
+    let Some(idx) = self
+      .headers
+      .iter()
+      .position(|h| h.to_lowercase() == header.to_lowercase())
+    else {
+      return Err(format!("Header '{}' not found", header));
+    };
+    self.rows.sort_by(|a, b| {
+      let col_a = a.get(idx).map(|s| s.as_str()).unwrap_or("");
+      let col_b = b.get(idx).map(|s| s.as_str()).unwrap_or("");
+      match (col_a.parse::<f64>(), col_b.parse::<f64>()) {
+        (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+        _ => col_a.cmp(col_b),
+      }
+    });
+    Ok(())
   }
   pub fn selected_row(&self) -> Option<usize> {
     self.selected_row
@@ -1540,6 +1564,27 @@ impl TableWidget {
       self.selected_row = Some(0);
     } else {
       self.selected_row = None;
+    }
+  }
+  pub fn scroll_down(&mut self) -> bool {
+    let visible = self.visible_rows.get();
+    if visible == 0 || self.rows.len() <= visible {
+      return false; // all rows visible, no scrolling needed
+    }
+    let max_offset = self.rows.len().saturating_sub(visible);
+    if self.scroll_offset < max_offset {
+      self.scroll_offset += 1;
+      true
+    } else {
+      false
+    }
+  }
+  pub fn scroll_up(&mut self) -> bool {
+    if self.scroll_offset > 0 {
+      self.scroll_offset -= 1;
+      true
+    } else {
+      false
     }
   }
   pub fn next_row(&mut self) -> bool {
@@ -1657,14 +1702,21 @@ impl ConfigWidget for TableWidget {
       ratatui::widgets::Row::new(cells).height(1)
     });
 
+    // borders (2) + header row (1) + header bottom_margin (1) = 4 lines of overhead
+    let visible = area.height.saturating_sub(4) as usize;
+    self.visible_rows.set(visible);
+
     let mut state = TableState::default();
-    if self.selected_row.is_some_and(|idx| idx >= self.rows.len()) {
+    if self.scroll_only {
+      state.select(None);
+      *state.offset_mut() = self.scroll_offset;
+    } else if self.selected_row.is_some_and(|idx| idx >= self.rows.len()) {
       state.select(None);
     } else {
       state.select(self.selected_row);
     }
 
-    let hl_style = if self.focused {
+    let hl_style = if self.focused && !self.scroll_only {
       Style::default()
         .bg(Color::Cyan)
         .fg(Color::Black)
@@ -1673,17 +1725,26 @@ impl ConfigWidget for TableWidget {
       Style::default()
     };
 
+    let border_style = if self.focused {
+      Style::default().fg(Color::Yellow)
+    } else {
+      Style::default()
+    };
+
+    let highlight_symbol = if self.scroll_only { "" } else { ">> " };
+
     let table = Table::new(rows, &self.widths)
       .header(header)
       .block(
         Block::default()
           .title(self.title.clone())
-          .borders(Borders::ALL),
+          .borders(Borders::ALL)
+          .border_style(border_style),
       )
       .widths(&self.widths)
       .column_spacing(1)
       .row_highlight_style(hl_style)
-      .highlight_symbol(">> ");
+      .highlight_symbol(highlight_symbol);
 
     f.render_stateful_widget(table, area, &mut state);
   }

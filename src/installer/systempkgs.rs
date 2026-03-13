@@ -139,9 +139,11 @@ impl Page for SystemPackages {
   ) -> super::Signal {
     use ratatui::crossterm::event::KeyCode;
 
-    // Handle quit/escape at the top level
+    // Handle quit/escape at the top level (unless search bar is focused)
     match event.code {
-      KeyCode::Esc | KeyCode::Char('q') => return Signal::Pop,
+      KeyCode::Esc | KeyCode::Char('q') if !self.package_picker.search_bar.is_focused() => {
+        return Signal::Pop;
+      }
       _ => {}
     }
 

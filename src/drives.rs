@@ -1,4 +1,4 @@
-use std::{process::Command, sync::atomic::AtomicU64};
+use std::{collections::BTreeMap, process::Command, sync::atomic::AtomicU64};
 
 use ratatui::layout::Constraint;
 use serde_json::Value;
@@ -144,9 +144,16 @@ pub fn lsblk() -> anyhow::Result<Vec<Disk>> {
   /// are currently being used by the live system
   fn is_safe_device(dev: &serde_json::Value) -> bool {
     // Check if this device is mounted at critical mount points
-    if let Some(mount) = dev.get("mountpoint").and_then(|m| m.as_str()) {
-      if mount == "/" || mount == "/iso" {
-        // "/" is the root filesystem, "/iso" is common in live environments
+    if let Some(mount) = dev.get("mountpoint").and_then(|m| m.as_str())
+      && (mount == "/" || mount == "/iso")
+    {
+      // "/" is the root filesystem, "/iso" is common in live environments
+      return false;
+    }
+
+    if let Some(size) = dev.get("size").and_then(|s| s.as_u64()) {
+      // Exclude devices smaller than 100MB, which are unlikely to be target disks
+      if size < 100 * 1024 * 1024 {
         return false;
       }
     }
@@ -322,15 +329,43 @@ pub fn disk_table(disks: &[Disk]) -> TableWidget {
   TableWidget::new("Disks", widths, headers, rows)
 }
 
+pub fn part_table_multi(disks: &DiskConfig) -> TableWidget {
+  let disks = disks.disks();
+  let (headers, widths): (Vec<String>, Vec<Constraint>) =
+    DiskTableHeader::partition_table_header_info()
+      .into_iter()
+      .unzip();
+
+  let mut rows: Vec<Vec<String>> = vec![];
+  for disk in disks {
+    let sector_size = disk.sector_size();
+    let name = disk.name();
+    for item in disk.layout() {
+      rows.push(item.as_table_row(
+        sector_size,
+        name,
+        &DiskTableHeader::partition_table_headers(),
+      ));
+    }
+  }
+  TableWidget::new("Partitions", widths, headers, rows)
+}
+
 /// Return a table showing available partitions for a disk device
-pub fn part_table(disk_items: &[DiskItem], sector_size: u64) -> TableWidget {
+pub fn part_table(disk_items: &[DiskItem], sector_size: u64, disk_name: &str) -> TableWidget {
   let (headers, widths): (Vec<String>, Vec<Constraint>) =
     DiskTableHeader::partition_table_header_info()
       .into_iter()
       .unzip();
   let rows: Vec<Vec<String>> = disk_items
     .iter()
-    .map(|item| item.as_table_row(sector_size, &DiskTableHeader::partition_table_headers()))
+    .map(|item| {
+      item.as_table_row(
+        sector_size,
+        disk_name,
+        &DiskTableHeader::partition_table_headers(),
+      )
+    })
     .collect();
   TableWidget::new("Partitions", widths, headers, rows)
 }
@@ -723,7 +758,7 @@ impl Disk {
   }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum DiskItem {
   Partition(Partition),
   FreeSpace { id: u64, start: u64, size: u64 }, // size in sectors
@@ -748,7 +783,12 @@ impl DiskItem {
       DiskItem::FreeSpace { .. } => None,
     }
   }
-  pub fn as_table_row(&self, sector_size: u64, headers: &[DiskTableHeader]) -> Vec<String> {
+  pub fn as_table_row(
+    &self,
+    sector_size: u64,
+    disk_name: &str,
+    headers: &[DiskTableHeader],
+  ) -> Vec<String> {
     match self {
       DiskItem::Partition(p) => {
         headers
@@ -762,11 +802,11 @@ impl DiskItem {
                 PartStatus::Create => "create".into(),
                 PartStatus::Unknown => "unknown".into(),
               },
-              DiskTableHeader::Device => p.name().unwrap_or("").into(),
+              DiskTableHeader::Device => p.name().unwrap_or(disk_name).into(),
               DiskTableHeader::Label => p.label().unwrap_or("").into(),
               DiskTableHeader::Start => p.start().to_string(),
               DiskTableHeader::End => (p.end() - 1).to_string(),
-              DiskTableHeader::Size => bytes_readable(p.size_bytes(sector_size)),
+              DiskTableHeader::Size => bytes_readable(p.size_bytes(p.sector_size)),
               DiskTableHeader::FSType => p.fs_type().unwrap_or("").into(),
               DiskTableHeader::MountPoint => p.mount_point().unwrap_or("").into(),
               DiskTableHeader::Flags => p.flags().join(","),
@@ -781,7 +821,7 @@ impl DiskItem {
           .map(|h| {
             match h {
               DiskTableHeader::Status => "free".into(),
-              DiskTableHeader::Device => "".into(),
+              DiskTableHeader::Device => disk_name.into(),
               DiskTableHeader::Label => "".into(),
               DiskTableHeader::Start => start.to_string(),
               DiskTableHeader::End => ((start + size) - 1).to_string(),
@@ -807,7 +847,7 @@ pub enum PartStatus {
   Unknown,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Partition {
   id: u64,
   start: u64,       // sectors
@@ -1060,6 +1100,63 @@ impl PartitionBuilder {
 impl Default for PartitionBuilder {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DiskConfig {
+  disks: BTreeMap<String, Disk>,
+}
+
+impl From<Vec<Disk>> for DiskConfig {
+  fn from(value: Vec<Disk>) -> Self {
+    let mut disks = BTreeMap::new();
+    for disk in value {
+      disks.insert(disk.name().to_string(), disk);
+    }
+    Self { disks }
+  }
+}
+
+impl Default for DiskConfig {
+  fn default() -> Self {
+    Self {
+      disks: BTreeMap::new(),
+    }
+  }
+}
+
+impl DiskConfig {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  pub fn get(&self, name: &str) -> Option<&Disk> {
+    self.disks.get(name)
+  }
+
+  pub fn get_mut(&mut self, name: &str) -> Option<&mut Disk> {
+    self.disks.get_mut(name)
+  }
+
+  pub fn upsert(&mut self, disk: Disk) {
+    self.disks.insert(disk.name().to_string(), disk);
+  }
+
+  pub fn remove(&mut self, disk_name: &str) {
+    self.disks.remove(disk_name);
+  }
+
+  pub fn disks(&self) -> impl Iterator<Item = &Disk> {
+    self.disks.values()
+  }
+
+  pub fn disks_mut(&mut self) -> impl Iterator<Item = &mut Disk> {
+    self.disks.values_mut()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.disks.is_empty()
   }
 }
 

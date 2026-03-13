@@ -125,8 +125,9 @@ fn main() -> anyhow::Result<()> {
     let _raw_guard = RawModeGuard::new(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    debug!("Running TUI");
-    run_app(&mut terminal)
+    let dry_run = env::args().any(|arg| arg == "--dry-run");
+    debug!("Running TUI (dry_run={dry_run})");
+    run_app(&mut terminal, dry_run)
   };
 
   debug!("Exiting TUI");
@@ -147,6 +148,10 @@ fn handle_signal(
     }
     Signal::Push(new_page) => {
       page_stack.push(new_page);
+    }
+    Signal::PopAndPush(new_page) => {
+      handle_signal(Signal::Pop, page_stack, installer)?;
+      handle_signal(Signal::Push(new_page), page_stack, installer)?;
     }
     Signal::Pop => {
       page_stack.pop();
@@ -222,8 +227,12 @@ fn handle_signal(
 /// - Pages are pushed/popped based on user navigation
 /// - Each page can send signals to control the overall application flow
 /// - The event loop handles both user input and periodic updates (ticks)
-pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> anyhow::Result<()> {
+pub fn run_app(
+  terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+  dry_run: bool,
+) -> anyhow::Result<()> {
   let mut installer = Installer::new();
+  installer.dry_run = dry_run;
   let mut page_stack: Vec<Box<dyn Page>> = vec![];
   page_stack.push(Box::new(Menu::new()));
 
@@ -289,20 +298,21 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> an
 
     // Wait for user input or timeout
     if event::poll(timeout)?
-		&& let Event::Key(key) = event::read()? {
-			if let Some(page) = page_stack.last_mut() {
-				// Forward keyboard input to the current page
-				let signal = page.handle_input(&mut installer, key);
+      && let Event::Key(key) = event::read()?
+    {
+      if let Some(page) = page_stack.last_mut() {
+        // Forward keyboard input to the current page
+        let signal = page.handle_input(&mut installer, key);
 
-				if handle_signal(signal, &mut page_stack, &mut installer)? {
-					// Page requested application quit
-					break;
-				}
-			} else {
-				// Safety fallback: if no pages exist, return to main menu
-				page_stack.push(Box::new(Menu::new()));
-			}
-		}
+        if handle_signal(signal, &mut page_stack, &mut installer)? {
+          // Page requested application quit
+          break;
+        }
+      } else {
+        // Safety fallback: if no pages exist, return to main menu
+        page_stack.push(Box::new(Menu::new()));
+      }
+    }
 
     if last_tick.elapsed() >= tick_rate {
       last_tick = Instant::now();

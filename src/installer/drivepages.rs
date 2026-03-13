@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::{
   drives::{
-    DiskItem, PartStatus, Partition, bytes_readable, disk_table, lsblk, parse_sectors, part_table,
+    DiskConfig, DiskItem, PartStatus, Partition, bytes_readable, disk_table, lsblk, parse_sectors,
+    part_table, part_table_multi,
   },
   installer::{Installer, Page, Signal},
   split_hor, split_vert, styled_block, ui_back, ui_close, ui_down, ui_enter, ui_up,
@@ -109,7 +110,10 @@ impl<'a> Drives<'a> {
         None,
         "• Best-effort default - Automatic partitioning (recommended)",
       )],
-      vec![(None, "• Manual configuration - Advanced users only")],
+      vec![(
+        None,
+        "• Manual configuration - Configure partition layout manually",
+      )],
       vec![(None, "")],
       vec![
         (Some((Color::Red, Modifier::BOLD)), "WARNING: "),
@@ -174,15 +178,21 @@ impl<'a> Page for Drives<'a> {
           Err(e) => return Signal::Error(anyhow::anyhow!("Failed to list block devices: {e}")),
         };
         let table = disk_table(&disks);
-        installer.drives = disks;
+        installer.drives = disks.clone();
         match idx {
           0 => {
-            installer.use_auto_drive_config = true;
-            Signal::Push(Box::new(SelectDrive::new(table)))
+            installer.use_auto_disk_config = true;
+            Signal::Push(Box::new(SelectDrive::new(
+              table,
+              installer.disk_config.clone(),
+            )))
           }
           1 => {
-            installer.use_auto_drive_config = false;
-            Signal::Push(Box::new(SelectDrive::new(table)))
+            installer.use_auto_disk_config = false;
+            Signal::Push(Box::new(SelectDrive::new(
+              table,
+              installer.disk_config.clone(),
+            )))
           }
           2 => Signal::Pop,
           _ => Signal::Wait,
@@ -230,13 +240,24 @@ impl<'a> Page for Drives<'a> {
   }
 }
 
+enum SelectDriveFocus {
+  Table,
+  Preview,
+  Buttons,
+}
+
 pub struct SelectDrive {
   table: TableWidget,
+  pending_config: DiskConfig,
+  preview_table: TableWidget,
+  buttons: WidgetBox,
+  focus: SelectDriveFocus,
+  confirming_clear: bool,
   help_modal: HelpModal<'static>,
 }
 
 impl SelectDrive {
-  pub fn new(mut table: TableWidget) -> Self {
+  pub fn new(mut table: TableWidget, pending_config: DiskConfig) -> Self {
     table.focus();
     let help_content = styled_block(vec![
       vec![
@@ -245,7 +266,7 @@ impl SelectDrive {
       ],
       vec![
         (Some((Color::Yellow, Modifier::BOLD)), "Enter"),
-        (None, " - Select drive for installation"),
+        (None, " - Select drive for configuration"),
       ],
       vec![
         (Some((Color::Yellow, Modifier::BOLD)), "Esc"),
@@ -258,7 +279,7 @@ impl SelectDrive {
       vec![(None, "")],
       vec![(
         None,
-        "Select the drive you want to use for your NixOS installation.",
+        "Select the drive you want to configure for your NixOS installation.",
       )],
       vec![(
         None,
@@ -270,13 +291,56 @@ impl SelectDrive {
       ],
     ]);
     let help_modal = HelpModal::new("Select Drive", help_content);
-    Self { table, help_modal }
+    let mut preview_table = part_table_multi(&pending_config);
+    preview_table.scroll_only = true;
+    preview_table.sort_rows_by_header("status").ok();
+    let buttons = WidgetBox::button_menu(vec![
+      Box::new(Button::new("Clear Configuration")) as Box<dyn ConfigWidget>,
+      Box::new(Button::new("Save and Exit")) as Box<dyn ConfigWidget>,
+      Box::new(Button::new("Back")) as Box<dyn ConfigWidget>,
+    ]);
+    Self {
+      table,
+      help_modal,
+      pending_config,
+      preview_table,
+      buttons,
+      focus: SelectDriveFocus::Table,
+      confirming_clear: false,
+    }
   }
 }
 
 impl Page for SelectDrive {
-  fn render(&mut self, _installer: &mut Installer, f: &mut Frame, area: Rect) {
-    self.table.render(f, area);
+  fn render(&mut self, installer: &mut Installer, f: &mut Frame, area: Rect) {
+    if let Some(drive) = installer.editing_drive.take() {
+      let original = installer.drives.iter().find(|d| d.name() == drive.name());
+      let was_modified = original.is_some_and(|orig| orig.layout() != drive.layout());
+
+      if was_modified {
+        log::info!(
+          "Updating pending config for device {} with changes",
+          drive.name()
+        );
+        self.pending_config.upsert(drive);
+        self.preview_table = part_table_multi(&self.pending_config);
+        self.preview_table.scroll_only = true;
+        log::debug!("Updated pending config: {:#?}", self.pending_config);
+      }
+    }
+    let chunks = split_vert!(
+      area,
+      1,
+      [
+        Constraint::Percentage(40),
+        Constraint::Percentage(40),
+        Constraint::Percentage(20)
+      ]
+    );
+
+    self.table.render(f, chunks[0]);
+    self.preview_table.render(f, chunks[1]);
+    self.buttons.render(f, chunks[2]);
 
     // Render help modal on top
     self.help_modal.render(f, area);
@@ -285,40 +349,185 @@ impl Page for SelectDrive {
     match event.code {
       KeyCode::Char('?') => {
         self.help_modal.toggle();
-        Signal::Wait
+        return Signal::Wait;
       }
       ui_close!() if self.help_modal.visible => {
         self.help_modal.hide();
+        return Signal::Wait;
+      }
+      _ if self.help_modal.visible => {
+        return Signal::Wait;
+      }
+      _ => {}
+    }
+
+    if self.confirming_clear && event.code != KeyCode::Enter {
+      self.confirming_clear = false;
+      self.buttons.set_children_inplace(vec![
+        Box::new(Button::new("Clear Configuration")) as Box<dyn ConfigWidget>,
+        Box::new(Button::new("Save and Exit")) as Box<dyn ConfigWidget>,
+        Box::new(Button::new("Back")) as Box<dyn ConfigWidget>,
+      ]);
+      return Signal::Wait;
+    }
+
+    match event.code {
+      ui_back!() => {
+        installer.disk_config = std::mem::take(&mut self.pending_config);
+        Signal::Pop
+      }
+      KeyCode::Tab => {
+        match self.focus {
+          SelectDriveFocus::Table => {
+            self.table.unfocus();
+            self.preview_table.focus();
+            self.focus = SelectDriveFocus::Preview;
+          }
+          SelectDriveFocus::Preview => {
+            self.preview_table.unfocus();
+            self.buttons.focus();
+            self.focus = SelectDriveFocus::Buttons;
+          }
+          SelectDriveFocus::Buttons => {
+            self.buttons.unfocus();
+            self.table.focus();
+            self.focus = SelectDriveFocus::Table;
+          }
+        }
         Signal::Wait
       }
-      _ if self.help_modal.visible => Signal::Wait,
-      ui_back!() => Signal::Pop,
       ui_up!() => {
-        self.table.previous_row();
+        match self.focus {
+          SelectDriveFocus::Table => {
+            if !self.table.previous_row() {
+              // At top of table, wrap to bottom of buttons
+              self.table.unfocus();
+              self.buttons.focus();
+              self.focus = SelectDriveFocus::Buttons;
+              while self.buttons.next_child() {}
+            }
+          }
+          SelectDriveFocus::Preview => {
+            if !self.preview_table.scroll_up() {
+              // At top of preview, move to bottom of table
+              self.preview_table.unfocus();
+              self.table.focus();
+              self.focus = SelectDriveFocus::Table;
+              while self.table.next_row() {}
+            }
+          }
+          SelectDriveFocus::Buttons => {
+            if !self.buttons.prev_child() {
+              // At top of buttons, move to bottom of preview
+              self.buttons.unfocus();
+              self.preview_table.focus();
+              self.focus = SelectDriveFocus::Preview;
+              while self.preview_table.next_row() {}
+            }
+          }
+        }
         Signal::Wait
       }
       ui_down!() => {
-        self.table.next_row();
+        match self.focus {
+          SelectDriveFocus::Table => {
+            if !self.table.next_row() {
+              // At bottom of table, move to top of preview
+              self.table.unfocus();
+              self.preview_table.focus();
+              self.focus = SelectDriveFocus::Preview;
+              while self.preview_table.previous_row() {}
+            }
+          }
+          SelectDriveFocus::Preview => {
+            if !self.preview_table.scroll_down() {
+              // At bottom of preview, move to top of buttons
+              self.preview_table.unfocus();
+              self.buttons.focus();
+              self.focus = SelectDriveFocus::Buttons;
+              while self.buttons.prev_child() {}
+            }
+          }
+          SelectDriveFocus::Buttons => {
+            if !self.buttons.next_child() {
+              // At bottom of buttons, wrap to top of table
+              self.buttons.unfocus();
+              self.table.focus();
+              self.focus = SelectDriveFocus::Table;
+              while self.table.previous_row() {}
+            }
+          }
+        }
         Signal::Wait
       }
       ui_enter!() => {
-        if let Some(row) = self.table.selected_row() {
-          let Some(disk) = installer.drives.get(row) else {
-            return Signal::Error(anyhow::anyhow!("Failed to find drive info'"));
-          };
+        match self.focus {
+          SelectDriveFocus::Preview => Signal::Wait,
+          SelectDriveFocus::Table => {
+            if let Some(row) = self.table.selected_row() {
+              let Some(disk) = installer.drives.get(row) else {
+                return Signal::Error(anyhow::anyhow!("Failed to find drive info'"));
+              };
+              let editing = self
+                .pending_config
+                .get(disk.name())
+                .cloned()
+                .unwrap_or_else(|| disk.clone());
 
-          installer.drive_config = Some(disk.clone());
-          if installer.use_auto_drive_config {
-            Signal::Push(Box::new(SelectFilesystem::new(None)))
-          } else {
-            let Some(ref drive) = installer.drive_config else {
-              return Signal::Error(anyhow::anyhow!("No drive config available"));
-            };
-            let table = part_table(drive.layout(), drive.sector_size());
-            Signal::Push(Box::new(ManualPartition::new(table)))
+              installer.editing_drive = Some(editing);
+              if installer.use_auto_disk_config {
+                Signal::Push(Box::new(SelectFilesystem::new(None)))
+              } else {
+                let Some(ref drive) = installer.editing_drive else {
+                  return Signal::Error(anyhow::anyhow!("No drive config available"));
+                };
+                let table = part_table(drive.layout(), drive.sector_size(), drive.name());
+                Signal::Push(Box::new(ManualPartition::new(table)))
+              }
+            } else {
+              Signal::Wait
+            }
           }
-        } else {
-          Signal::Wait
+          SelectDriveFocus::Buttons => {
+            let Some(idx) = self.buttons.selected_child() else {
+              return Signal::Wait;
+            };
+            match idx {
+              0 => {
+                // Clear Configuration
+                if !self.confirming_clear {
+                  self.confirming_clear = true;
+                  self.buttons.set_children_inplace(vec![
+                    Box::new(Button::new("Really?")) as Box<dyn ConfigWidget>,
+                    Box::new(Button::new("Save and Exit")) as Box<dyn ConfigWidget>,
+                    Box::new(Button::new("Back")) as Box<dyn ConfigWidget>,
+                  ]);
+                  Signal::Wait
+                } else {
+                  self.confirming_clear = false;
+                  self.pending_config = DiskConfig::new();
+                  self.preview_table = part_table_multi(&self.pending_config);
+                  self.buttons.set_children_inplace(vec![
+                    Box::new(Button::new("Clear Configuration")) as Box<dyn ConfigWidget>,
+                    Box::new(Button::new("Save and Exit")) as Box<dyn ConfigWidget>,
+                    Box::new(Button::new("Back")) as Box<dyn ConfigWidget>,
+                  ]);
+                  Signal::Wait
+                }
+              }
+              1 => {
+                // Save and Exit
+                installer.disk_config = std::mem::take(&mut self.pending_config);
+                Signal::Unwind
+              }
+              2 => {
+                // Back
+                installer.disk_config = std::mem::take(&mut self.pending_config);
+                Signal::Pop
+              }
+              _ => Signal::Wait,
+            }
+          }
         }
       }
       _ => Signal::Wait,
@@ -758,14 +967,14 @@ impl Page for SelectFilesystem {
         }
         .to_string();
 
-        if installer.use_auto_drive_config {
-          if let Some(config) = installer.drive_config.as_mut() {
+        if installer.use_auto_disk_config {
+          if let Some(config) = installer.editing_drive.as_mut() {
             config.use_default_layout(Some(fs));
           }
-          installer.make_drive_config_display();
-          return Signal::PopCount(3);
+          // Pop back to SelectDrive so it can commit the editing_drive
+          return Signal::Pop;
         } else {
-          let Some(config) = installer.drive_config.as_mut() else {
+          let Some(config) = installer.editing_drive.as_mut() else {
             return Signal::Error(anyhow::anyhow!("No drive config available"));
           };
           let Some(id) = self.dev_id else {
@@ -876,11 +1085,11 @@ impl ManualPartition {
 
 impl Page for ManualPartition {
   fn render(&mut self, installer: &mut Installer, f: &mut Frame, area: Rect) {
-    let Some(ref config) = installer.drive_config else {
+    let Some(ref config) = installer.editing_drive else {
       log::error!("No drive config available for manual partitioning");
       return;
     };
-    let rows = part_table(config.layout(), config.sector_size())
+    let rows = part_table(config.layout(), config.sector_size(), config.name())
       .rows()
       .to_vec();
     self.disk_config.set_rows(rows);
@@ -939,7 +1148,7 @@ impl Page for ManualPartition {
     }
     if self.disk_config.is_focused() {
       match event.code {
-        ui_back!() => Signal::PopCount(2),
+        ui_back!() => Signal::Pop,
         ui_up!() => {
           if !self.disk_config.previous_row() {
             self.disk_config.unfocus();
@@ -969,7 +1178,7 @@ impl Page for ManualPartition {
               row
             ));
           };
-          let Some(ref drive) = installer.drive_config else {
+          let Some(ref drive) = installer.editing_drive else {
             return Signal::Error(anyhow::anyhow!("No drive config available"));
           };
           let layout = drive.layout();
@@ -994,7 +1203,10 @@ impl Page for ManualPartition {
       }
     } else if self.buttons.is_focused() {
       match event.code {
-        ui_back!() => Signal::PopCount(2),
+        ui_back!() => {
+          installer.editing_drive = None;
+          Signal::Pop
+        }
         ui_up!() => {
           if !self.buttons.prev_child() {
             self.buttons.unfocus();
@@ -1021,9 +1233,8 @@ impl Page for ManualPartition {
               Signal::Push(Box::new(SuggestPartition::new()))
             }
             1 => {
-              // Confirm and Exit
-              installer.make_drive_config_display();
-              return Signal::Unwind;
+              // Confirm and Exit — save and pop back to SelectDrive
+              Signal::Pop
             }
             2 => {
               if !self.confirming_reset {
@@ -1037,7 +1248,7 @@ impl Page for ManualPartition {
                 self.buttons.set_children_inplace(new_buttons);
                 Signal::Wait
               } else {
-                let Some(ref mut device) = installer.drive_config else {
+                let Some(ref mut device) = installer.editing_drive else {
                   return Signal::Wait;
                 };
                 device.reset_layout();
@@ -1055,8 +1266,8 @@ impl Page for ManualPartition {
               }
             }
             3 => {
-              // Abort
-              return Signal::PopCount(2);
+              installer.editing_drive = None;
+              Signal::Pop
             }
             _ => Signal::Wait,
           }
@@ -1230,7 +1441,7 @@ impl Page for SuggestPartition {
         match idx {
           0 => {
             // Yes
-            if let Some(ref mut config) = installer.drive_config {
+            if let Some(ref mut config) = installer.editing_drive {
               config.use_default_layout(Some("ext4".into()));
             } else {
               return Signal::Error(anyhow::anyhow!(
@@ -1413,7 +1624,7 @@ impl NewPartition {
         if input.is_empty() {
           input = "100%";
         }
-        let Some(ref device) = installer.drive_config else {
+        let Some(ref device) = installer.editing_drive else {
           return Signal::Error(anyhow::anyhow!(
             "No drive config available for new partition size input"
           ));
@@ -1564,7 +1775,7 @@ impl NewPartition {
       KeyCode::Enter => {
         let input = self.mount_input.get_value().unwrap();
         let input = input.as_str().unwrap().trim(); // TODO: handle these unwraps
-        let Some(ref mut device) = installer.drive_config else {
+        let Some(ref mut device) = installer.editing_drive else {
           return Signal::Error(anyhow::anyhow!(
             "No drive config available for new partition mount point input"
           ));
@@ -1650,8 +1861,7 @@ impl Page for NewPartition {
 
 pub struct AlterPartition {
   pub buttons: WidgetBox,
-  pub part_id: u64,
-  pub part_status: PartStatus,
+  pub partition: Partition,
 }
 
 impl AlterPartition {
@@ -1662,8 +1872,7 @@ impl AlterPartition {
     button_row.focus();
     Self {
       buttons: button_row,
-      part_id: part.id(),
-      part_status: *part_status,
+      partition: part,
     }
   }
   pub fn buttons_by_status(status: PartStatus, flags: &[String]) -> Vec<Box<dyn ConfigWidget>> {
@@ -1830,7 +2039,7 @@ impl AlterPartition {
 
 impl Page for AlterPartition {
   fn render(&mut self, _installer: &mut Installer, f: &mut Frame, area: Rect) {
-    match &self.part_status {
+    match &self.partition.status() {
       PartStatus::Exists => {
         self.render_existing_part(f, area);
       }
@@ -1864,34 +2073,34 @@ impl Page for AlterPartition {
         Signal::Wait
       }
       ui_enter!() => {
-        if self.part_status == PartStatus::Delete {
+        if *self.partition.status() == PartStatus::Delete {
           return Signal::Pop;
         }
         let Some(idx) = self.buttons.selected_child() else {
           return Signal::Wait;
         };
-        let Some(ref mut device) = installer.drive_config else {
+        let Some(ref mut device) = installer.editing_drive else {
           return Signal::Error(anyhow::anyhow!(
             "No drive config available for altering partition"
           ));
         };
-        match self.part_status {
+        match *self.partition.status() {
           PartStatus::Exists => {
-            let Some(part) = device.partition_by_id_mut(self.part_id) else {
+            let Some(part) = device.partition_by_id_mut(self.partition.id()) else {
               return Signal::Error(anyhow::anyhow!(
                 "No partition found with id {}",
-                self.part_id
+                self.partition.id()
               ));
             };
             match idx {
               0 => {
                 // Set Mount Point
-                Signal::Push(Box::new(SetMountPoint::new(self.part_id)))
+                Signal::Push(Box::new(SetMountPoint::new(self.partition.id())))
               }
               1 => {
                 // Mark For Modification
                 part.set_status(PartStatus::Modify);
-                Signal::Pop
+                Signal::PopAndPush(Box::new(Self::new(part.clone())) as Box<dyn Page>)
               }
               2 => {
                 // Delete Partition
@@ -1910,7 +2119,7 @@ impl Page for AlterPartition {
             match idx {
               0 => {
                 // Set Mount Point
-                Signal::Push(Box::new(SetMountPoint::new(self.part_id)))
+                Signal::Push(Box::new(SetMountPoint::new(self.partition.id())))
               }
               1 => {
                 if let Some(child) = self.buttons.focused_child_mut() {
@@ -1919,7 +2128,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("boot");
                       } else {
@@ -1937,7 +2146,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("esp");
                       } else {
@@ -1955,7 +2164,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("bls_boot");
                       } else {
@@ -1968,22 +2177,24 @@ impl Page for AlterPartition {
               }
               4 => {
                 // Change Filesystem
-                Signal::Push(Box::new(SelectFilesystem::new(Some(self.part_id))))
+                Signal::Push(Box::new(SelectFilesystem::new(Some(self.partition.id()))))
               }
               5 => {
                 // Set Label
-                Signal::Push(Box::new(SetLabel::new(self.part_id)))
+                Signal::Push(Box::new(SetLabel::new(self.partition.id())))
               }
               6 => {
                 // Unmark for modification
-                if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                   part.set_status(PartStatus::Exists);
+                  Signal::PopAndPush(Box::new(Self::new(part.clone())) as Box<dyn Page>)
+                } else {
+                  Signal::Wait
                 }
-                Signal::Pop
               }
               7 => {
                 // Delete Partition
-                if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                   part.set_status(PartStatus::Delete);
                 }
                 Signal::Pop
@@ -1999,7 +2210,7 @@ impl Page for AlterPartition {
             match idx {
               0 => {
                 // Set Mount Point
-                Signal::Push(Box::new(SetMountPoint::new(self.part_id)))
+                Signal::Push(Box::new(SetMountPoint::new(self.partition.id())))
               }
               1 => {
                 if let Some(child) = self.buttons.focused_child_mut() {
@@ -2008,7 +2219,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("boot");
                       } else {
@@ -2026,7 +2237,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("esp");
                       } else {
@@ -2044,7 +2255,7 @@ impl Page for AlterPartition {
                     let Value::Bool(checked) = value else {
                       return Signal::Wait;
                     };
-                    if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                    if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                       if checked {
                         part.add_flag("bls_boot");
                       } else {
@@ -2057,18 +2268,18 @@ impl Page for AlterPartition {
               }
               4 => {
                 // Change Filesystem
-                Signal::Push(Box::new(SelectFilesystem::new(Some(self.part_id))))
+                Signal::Push(Box::new(SelectFilesystem::new(Some(self.partition.id()))))
               }
               5 => {
                 // Set Label
-                Signal::Push(Box::new(SetLabel::new(self.part_id)))
+                Signal::Push(Box::new(SetLabel::new(self.partition.id())))
               }
               6 => {
                 // Delete Partition
-                if let Some(part) = device.partition_by_id_mut(self.part_id) {
+                if let Some(part) = device.partition_by_id_mut(self.partition.id()) {
                   part.set_status(PartStatus::Delete);
                 }
-                if let Err(e) = device.remove_partition(self.part_id) {
+                if let Err(e) = device.remove_partition(self.partition.id()) {
                   return Signal::Error(anyhow::anyhow!("{}", e));
                 };
                 Signal::Pop
@@ -2167,7 +2378,7 @@ impl Page for SetMountPoint {
           .unwrap()
           .trim()
           .to_string();
-        let Some(device) = installer.drive_config.as_mut() else {
+        let Some(device) = installer.editing_drive.as_mut() else {
           return Signal::Error(anyhow::anyhow!(
             "No drive config available for setting mount point"
           ));
@@ -2280,12 +2491,12 @@ impl Page for SetLabel {
           self.editor.error("Label cannot contain spaces.");
           return Signal::Wait;
         }
-        let Some(drive_config) = installer.drive_config.as_mut() else {
+        let Some(disk_config) = installer.editing_drive.as_mut() else {
           return Signal::Error(anyhow::anyhow!(
             "No drive config available for setting partition label"
           ));
         };
-        let Some(part) = drive_config.partition_by_id_mut(self.dev_id) else {
+        let Some(part) = disk_config.partition_by_id_mut(self.dev_id) else {
           return Signal::Error(anyhow::anyhow!(
             "No partition found with id {}",
             self.dev_id

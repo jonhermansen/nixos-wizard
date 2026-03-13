@@ -20,7 +20,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
   command,
-  drives::{Disk, DiskItem, part_table},
+  drives::{Disk, DiskConfig, part_table_multi},
   installer::{systempkgs::get_available_pkgs, users::User},
   nixgen::highlight_nix,
   split_hor, split_vert, styled_block, ui_back, ui_close, ui_down, ui_enter, ui_left, ui_right,
@@ -83,12 +83,16 @@ pub struct Installer {
   pub ssh_config: Option<SshCfg>,
   pub timezone: Option<String>,
 
+  #[serde(skip)]
+  pub dry_run: bool,
+
   pub drives: Vec<Disk>,
 
-  pub drive_config: Option<Disk>,
-  pub use_auto_drive_config: bool,
-
-  pub drive_config_display: Option<Vec<DiskItem>>,
+  pub disk_config: DiskConfig,
+  pub use_auto_disk_config: bool,
+  /// Scratch space for the drive currently being edited by partition pages.
+  /// Gets upserted into disk_config when the user confirms.
+  pub editing_drive: Option<Disk>,
 
   /// Used as an escape hatch for inter-page communication
   /// If you can't find a good way to pass a value from one page to another
@@ -104,15 +108,8 @@ impl Installer {
   pub fn has_all_requirements(&self) -> bool {
     self.root_passwd_hash.is_some()
       && !self.users.is_empty()
-      && self.drive_config.is_some()
+      && !self.disk_config.is_empty()
       && self.bootloader.is_some()
-  }
-  pub fn make_drive_config_display(&mut self) {
-    let Some(drive) = &self.drive_config else {
-      self.drive_config_display = None;
-      return;
-    };
-    self.drive_config_display = Some(drive.layout().to_vec())
   }
 
   pub fn to_json(&mut self) -> anyhow::Result<serde_json::Value> {
@@ -140,15 +137,19 @@ impl Installer {
       "kernels": self.kernels
     });
 
-    // drive configuration if present
-    let disko_cfg = self.drive_config.as_mut().map(|d| d.as_disko_cfg());
+    // drive configuration — collect disko configs from all configured drives
+    let disko_cfgs: Vec<serde_json::Value> = self
+      .disk_config
+      .disks_mut()
+      .map(|d| d.as_disko_cfg())
+      .collect();
 
     // flake configuration if using flakes
     let flake_path = self.flake_path.clone();
 
     let config = serde_json::json!({
       "config": sys_config,
-      "disko": disko_cfg,
+      "disko": disko_cfgs,
       "flake_path": flake_path,
     });
 
@@ -164,6 +165,7 @@ impl Installer {
 pub enum Signal {
   Wait,
   Push(Box<dyn Page>),
+  PopAndPush(Box<dyn Page>), // Pop the current page and push a new one in its place
   Pop,
   PopCount(usize),
   Quit,
@@ -183,6 +185,7 @@ impl Debug for Signal {
       Self::WriteCfg => write!(f, "Signal::WriteCfg"),
       Self::Unwind => write!(f, "Signal::Unwind"),
       Self::Error(err) => write!(f, "Signal::Error({err})"),
+      Self::PopAndPush(_) => write!(f, "Signal::PopAndPush"),
     }
   }
 }
@@ -308,15 +311,11 @@ impl MenuPages {
       MenuPages::Locale => Locale::display_widget(installer),
       MenuPages::EnableFlakes => EnableFlakes::display_widget(installer),
       MenuPages::Drives => {
-        let sector_size = installer
-          .drive_config
-          .as_ref()
-          .map(|d| d.sector_size())
-          .unwrap_or(512);
-        installer
-          .drive_config_display
-          .as_deref()
-          .map(|d| Box::new(part_table(d, sector_size)) as Box<dyn ConfigWidget>)
+        if installer.disk_config.is_empty() {
+          None
+        } else {
+          Some(Box::new(part_table_multi(&installer.disk_config)) as Box<dyn ConfigWidget>)
+        }
       }
       MenuPages::Bootloader => Bootloader::display_widget(installer),
       MenuPages::Swap => Swap::display_widget(installer),
@@ -522,7 +521,7 @@ impl Menu {
         " - Root Password",
       )]);
     }
-    if installer.drives.is_empty() || installer.drive_config.is_none() {
+    if installer.disk_config.is_empty() {
       lines.push(vec![(
         Some((Color::Red, Modifier::BOLD)),
         " - Drive Configuration",
@@ -4532,11 +4531,40 @@ impl<'a> InstallProgress<'a> {
 
   /// The actual installation steps
   fn install_commands(
-    _installer: &Installer,
+    installer: &Installer,
     system_cfg_path: String,
     disk_cfg_path: String,
     log_file_path: String,
   ) -> anyhow::Result<Vec<(Line<'static>, VecDeque<Command>)>> {
+    if installer.dry_run {
+      return Ok(vec![
+        (Line::from("[DRY RUN] Beginning NixOS Installation..."),
+        vec![
+        command!("sh", "-c", format!("echo '[DRY RUN] Beginning NixOS Installation...' > {log_file_path}")),
+        command!("sleep", "1"),
+        ].into()),
+        (Line::from("[DRY RUN] Configuring disk layout (skipped)..."),
+        vec![
+        command!("sh", "-c", format!("echo '[DRY RUN] Would run: disko --yes-wipe-all-disks --mode destroy,format,mount {disk_cfg_path}' > {log_file_path}")),
+        command!("sh", "-c", format!("echo '[DRY RUN] Disko config contents:' >> {log_file_path} && cat {disk_cfg_path} >> {log_file_path}")),
+        ].into()),
+        (Line::from("[DRY RUN] Building NixOS configuration (skipped)..."),
+        vec![
+        command!("sh", "-c", format!("echo '[DRY RUN] Would run: nixos-generate-config --root /mnt' > {log_file_path}")),
+        command!("sh", "-c", format!("echo '[DRY RUN] Would run: cp {system_cfg_path} /mnt/etc/nixos/configuration.nix' >> {log_file_path}")),
+        command!("sh", "-c", format!("echo '[DRY RUN] System config contents:' >> {log_file_path} && cat {system_cfg_path} >> {log_file_path}")),
+        ].into()),
+        (Line::from("[DRY RUN] Installing NixOS (skipped)..."),
+        vec![
+        command!("sh", "-c", format!("echo '[DRY RUN] Would run: nixos-install --root /mnt' > {log_file_path}")),
+        ].into()),
+        (Line::from("[DRY RUN] Finalizing..."),
+        vec![
+        command!("sh", "-c", format!("echo '[DRY RUN] Installation dry run complete! No changes were made.' > {log_file_path}")),
+        ].into()),
+      ]);
+    }
+
     Ok(vec![
 			(Line::from("Beginning NixOS Installation..."),
 			vec![
@@ -4616,6 +4644,7 @@ impl<'a> Page for InstallProgress<'a> {
         Signal::WriteCfg => Some(Signal::WriteCfg),
         Signal::Unwind => Some(Signal::Unwind),
         Signal::Error(_) => Some(Signal::Wait),
+        Signal::PopAndPush(_) => Some(Signal::PopAndPush(Box::new(InstallComplete::new()))),
       }
     } else {
       None

@@ -241,18 +241,29 @@ impl NixWriter {
   pub fn write_disko_config(&self, config: Value) -> anyhow::Result<String> {
     log::debug!("Writing Disko config: {config}");
 
-    // Extract basic disk information
-    let device = config["device"].as_str().unwrap_or("/dev/sda");
-    let disk_type = config["type"].as_str().unwrap_or("disk");
-    let content = Self::parse_disko_content(&config["content"])?;
+    let disks = config
+      .as_array()
+      .ok_or_else(|| anyhow::anyhow!("Expected disko config to be an array of disk configs"))?;
 
-    let disko_config = attrset! {
-      "device" = nixstr(device);
-      "type" = nixstr(disk_type);
-      "content" = content;
-    };
+    let mut disk_attrs = Vec::new();
+    for disk in disks {
+      let device = disk["device"].as_str().unwrap_or("/dev/sda");
+      let disk_type = disk["type"].as_str().unwrap_or("disk");
+      let content = Self::parse_disko_content(&disk["content"])?;
 
-    let raw = format!("{{ disko.devices.disk.main = {disko_config}; }}");
+      // Derive a disko-friendly name from the device path (e.g. /dev/nvme0n1 -> nvme0n1)
+      let disk_name = device.rsplit('/').next().unwrap_or("main");
+
+      let disko_config = attrset! {
+        "device" = nixstr(device);
+        "type" = nixstr(disk_type);
+        "content" = content;
+      };
+
+      disk_attrs.push(format!("disko.devices.disk.{disk_name} = {disko_config};"));
+    }
+
+    let raw = format!("{{ {} }}", disk_attrs.join(" "));
     fmt_nix(raw)
   }
 
