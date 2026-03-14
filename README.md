@@ -78,7 +78,7 @@ sudo nix run github:km-clay/nixos-wizard
 You can build a custom NixOS ISO image that includes `nixos-wizard` and all its dependencies pre-installed:
 
 ```bash
-nix build github:km-clay/nixos-wizard#nixosConfigurations.installerIso.config.system.build.isoImage
+nix build github:km-clay/nixos-wizard#isoImage
 ```
 
 Boot this ISO on your target machine to run the installer in a fully-supported live environment.
